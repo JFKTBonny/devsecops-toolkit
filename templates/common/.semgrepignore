@@ -1,0 +1,8 @@
+node_modules/
+.venv/
+.m2/
+**/bin/
+**/obj/
+tests/
+dist/
+build/

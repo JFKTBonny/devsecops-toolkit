@@ -1,0 +1,168 @@
+pipeline {
+  agent any
+
+  options {
+    timeout(time: 60, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    REGISTRY    = 'registry.example.com'
+    IMAGE       = 'registry.example.com/python-app'
+    TAG         = "${BUILD_NUMBER}"
+    STAGING_URL = 'https://staging.example.com'
+  }
+
+  stages {
+    stage('Secrets Scan') {
+      steps {
+        sh 'docker run --rm -v "$WORKSPACE:/repo" ghcr.io/gitleaks/gitleaks:latest dir /repo -v'
+      }
+    }
+
+    stage('Build & Test') {
+      agent {
+        docker {
+          image 'python:3.12-slim'
+          args '-e HOME=/tmp'
+          reuseNode true
+        }
+      }
+      steps {
+        sh '''
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir pytest bandit pip-audit
+          mkdir -p reports
+          pytest -q --junitxml=reports/junit.xml || [ $? -eq 5 ]
+          # Django only - uncomment:
+          # python manage.py check --deploy --fail-level WARNING
+        '''
+      }
+      post {
+        always {
+          junit allowEmptyResults: true, testResults: 'reports/junit.xml'
+        }
+      }
+    }
+
+    stage('Security Scans') {
+      parallel {
+        stage('SAST - Semgrep') {
+          steps {
+            sh '''
+              docker run --rm -v "$WORKSPACE:/src" -w /src semgrep/semgrep \
+                semgrep scan --metrics=off --error \
+                --config p/python --config p/django --config p/flask --config p/owasp-top-ten
+            '''
+          }
+        }
+        stage('SAST - Bandit') {
+          agent {
+            docker {
+              image 'python:3.12-slim'
+              args '-e HOME=/tmp'
+              reuseNode true
+            }
+          }
+          steps {
+            sh '''
+              . .venv/bin/activate
+              bandit -r . -x ./.venv,./tests -ll -ii
+            '''
+          }
+        }
+        stage('Dependency Scan - pip-audit') {
+          agent {
+            docker {
+              image 'python:3.12-slim'
+              args '-e HOME=/tmp'
+              reuseNode true
+            }
+          }
+          steps {
+            sh '''
+              . .venv/bin/activate
+              pip-audit -r requirements.txt
+            '''
+          }
+        }
+        stage('Dependency Scan - Trivy') {
+          steps {
+            sh '''
+              docker run --rm -v "$WORKSPACE:/src" -v trivy-cache:/root/.cache/trivy \
+                aquasec/trivy:latest fs --scanners vuln \
+                --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed \
+                --skip-dirs /src/.venv /src
+            '''
+          }
+        }
+        stage('IaC Scan - Checkov') {
+          steps {
+            sh '''
+              docker run --rm -v "$WORKSPACE:/src" bridgecrew/checkov \
+                -d /src --compact --quiet --skip-path .venv
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Build Image') {
+      steps {
+        sh 'docker build -t "$IMAGE:$TAG" .'
+      }
+    }
+
+    stage('Image Scan') {
+      steps {
+        sh '''
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/trivy \
+            aquasec/trivy:latest image \
+            --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed \
+            "$IMAGE:$TAG"
+        '''
+      }
+    }
+
+    stage('SBOM') {
+      steps {
+        sh '''
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            anchore/syft:latest "$IMAGE:$TAG" -o cyclonedx-json > sbom.json
+        '''
+        archiveArtifacts artifacts: 'sbom.json', fingerprint: true
+      }
+    }
+
+    stage('Push Image') {
+      when { branch 'main' }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'registry-creds', usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
+          sh '''
+            echo "$REG_PASS" | docker login "$REGISTRY" -u "$REG_USER" --password-stdin
+            docker push "$IMAGE:$TAG"
+            docker logout "$REGISTRY"
+          '''
+        }
+      }
+    }
+
+    stage('DAST - ZAP') {
+      when { branch 'main' }
+      steps {
+        // Deploy to staging before this stage
+        sh 'docker run --rm ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "$STAGING_URL" -I'
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'docker rmi "$IMAGE:$TAG" || true'
+      deleteDir()
+    }
+  }
+}

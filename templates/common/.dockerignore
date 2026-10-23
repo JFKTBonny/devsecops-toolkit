@@ -1,0 +1,10 @@
+.git
+.m2
+node_modules
+.venv
+**/bin
+**/obj
+*.env
+.env*
+sbom.json
+reports

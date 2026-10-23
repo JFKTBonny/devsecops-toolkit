@@ -1,0 +1,2 @@
+# One CVE per line. Always add a reason and a review date.
+# CVE-2024-12345  # not exploitable: feature disabled - review 2027-01-01
